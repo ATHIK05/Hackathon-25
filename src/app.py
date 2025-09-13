@@ -40,7 +40,12 @@ class QuickCommerceChatbot:
             self.daily_full = complete_date_range(self.sales_data)
             self.daily_full = add_rolling_features(self.daily_full)
             self.daily_full = merge_inventory(self.daily_full, self.inventory_data)
-            self.latest = self.daily_full.groupby(['product_id', 'city_name'], group_keys=False).apply(lambda df: df.sort_values('date').iloc[-1], include_groups=False).reset_index(drop=True)
+            # Create latest data with proper grouping
+            if 'city_name' in self.daily_full.columns:
+                self.latest = self.daily_full.groupby(['product_id', 'city_name'], group_keys=False).apply(lambda df: df.sort_values('date').iloc[-1]).reset_index(drop=True)
+            else:
+                # Fallback if city_name doesn't exist
+                self.latest = self.daily_full.groupby(['product_id'], group_keys=False).apply(lambda df: df.sort_values('date').iloc[-1]).reset_index(drop=True)
             
             # Create product mapping
             self._create_product_mapping()
@@ -135,11 +140,15 @@ class QuickCommerceChatbot:
             result['product_name'] = best_match[1]
         
         # Extract city information
-        cities = self.latest['city_name'].unique() if self.latest is not None else []
-        for city in cities:
-            if city.lower() in query_lower:
-                result['city'] = city
-                break
+        if self.latest is not None and not self.latest.empty:
+            # Check if city_name column exists, otherwise use city column
+            city_col = 'city_name' if 'city_name' in self.latest.columns else 'city'
+            if city_col in self.latest.columns:
+                cities = self.latest[city_col].unique()
+                for city in cities:
+                    if city.lower() in query_lower:
+                        result['city'] = city
+                        break
         
         # Extract quantity
         import re
