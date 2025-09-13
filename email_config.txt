@@ -1,0 +1,28 @@
+# Email Configuration - COMPLETED ✅
+# ===================================
+
+# Email system is now fully configured and ready to use!
+
+# Configuration Details:
+# - Sender Email: mohamedathikr.22msc@kongu.edu
+# - App Password: iopc hfuw ryic jypx (configured in code)
+# - SMTP Servers: smtp.gmail.com:587, 465, 25 (multiple fallbacks)
+# - Default Recipient: rathikmohamed786@gmail.com
+# - Fallback: If SMTP fails, email saved as HTML file
+
+# Features:
+# ✅ Professional HTML email templates
+# ✅ Auto-generated PO numbers
+# ✅ Complete business calculations
+# ✅ Priority levels (HIGH/MEDIUM/LOW)
+# ✅ Terms and conditions
+# ✅ Responsive design
+
+# How to Use:
+# 1. Run the app: streamlit run src/app.py
+# 2. Upload your sales and inventory data
+# 3. Select a product with urgent stock needs
+# 4. Click "📤 Send Purchase Order Email"
+# 5. Professional PO email will be sent automatically!
+
+# The system is ready to send Purchase Orders! 🎉

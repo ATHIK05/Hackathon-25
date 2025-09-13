@@ -1,0 +1,6 @@
+thresholds:
+  urgent_stock_ratio: 0.2   # 20% of 3-day avg
+  safety_stock_days: 3      # minimum days of stock after allocation
+demand_analysis:
+  lookback_days: 7
+  top_n: 5
