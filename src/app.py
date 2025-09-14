@@ -14,14 +14,37 @@ from datetime import datetime, timedelta
 import sys
 import os
 
+# Set Cohere API key
+os.environ['COHERE_API_KEY'] = 'AcAOdKNntZDAYXtH7NrtfQOpgFyX9X9J2ORs9ZQK'
+
+from langchain.llms import Cohere
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+
 # Add src to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from data_processing import load_sales_inventory, complete_date_range
-from feature_engineering import add_rolling_features, merge_inventory
-from model import train_lgbm, prophet_forecast, prepare_lgbm_data
+from feature_engineering import add_rolling_features, merge_inventory, compute_days_of_stock
+from model import train_lgbm, prophet_forecast, prepare_lgbm_data, train_lstm_for_range, lstm_forecast, lstm_metrics_json, train_lstm_full_and_save, load_lstm_model, lstm_forecast_with_model
 from decision_engine import check_urgent, compute_allocation, generate_webhook_payload
 from email_system import PurchaseOrderEmailSystem
+
+# --- LangChain Cohere Integration ---
+def get_cohere_insight(json_data, user_query):
+    cohere = Cohere()
+    prompt = PromptTemplate(
+        input_variables=["json_data", "user_query"],
+        template="""
+        You are an expert business analyst. Given the following JSON data and user question, provide a smart, concise, and actionable insight for a business dashboard.\n
+        JSON Data: {json_data}\n
+        User Question: {user_query}\n
+        Insight:
+        """
+    )
+    chain = LLMChain(llm=cohere, prompt=prompt)
+    result = chain.run({"json_data": json_data, "user_query": user_query})
+    return result
 
 class QuickCommerceChatbot:
     def __init__(self):
@@ -40,15 +63,26 @@ class QuickCommerceChatbot:
             self.daily_full = complete_date_range(self.sales_data)
             self.daily_full = add_rolling_features(self.daily_full)
             self.daily_full = merge_inventory(self.daily_full, self.inventory_data)
+            self.daily_full = compute_days_of_stock(self.daily_full)
             # Create latest data with proper grouping
             if 'city_name' in self.daily_full.columns:
                 self.latest = self.daily_full.groupby(['product_id', 'city_name'], group_keys=False).apply(lambda df: df.sort_values('date').iloc[-1]).reset_index(drop=True)
             else:
-                # Fallback if city_name doesn't exist
                 self.latest = self.daily_full.groupby(['product_id'], group_keys=False).apply(lambda df: df.sort_values('date').iloc[-1]).reset_index(drop=True)
-            
-            # Create product mapping
             self._create_product_mapping()
+            # --- Load pre-trained LSTM model if available ---
+            self.lstm_model, self.lstm_scaler = load_lstm_model('lstm_model.h5', 'lstm_scaler.pkl')
+            if self.lstm_model is None or self.lstm_scaler is None:
+                st.warning("LSTM model files not found. Please train the model first using: python src/model.py --sales data/sales.csv --inventory data/inventory.csv --sample_size 10000 --epochs 10 --batch_size 32 --model_path lstm_model.h5 --scaler_path lstm_scaler.pkl")
+                self.lstm_metrics = None
+            else:
+                st.success("✅ Pre-trained LSTM model loaded successfully!")
+                # Load metrics if available
+                try:
+                    with open('lstm_metrics.json', 'r') as f:
+                        self.lstm_metrics = json.load(f)
+                except:
+                    self.lstm_metrics = None
             return True
         except Exception as e:
             st.error(f"Error loading data: {str(e)}")
@@ -94,7 +128,12 @@ class QuickCommerceChatbot:
             'product_name': None,
             'city': None,
             'quantity': None,
-            'action': None
+            'action': None,
+            'start_date': None,
+            'end_date': None,
+            'city_1': None,
+            'city_2': None,
+            'periods': 7  # Default forecast periods
         }
         
         # Extract product information - improved matching
@@ -150,22 +189,76 @@ class QuickCommerceChatbot:
                         result['city'] = city
                         break
         
-        # Extract quantity
+        # Extract quantity and periods
         import re
         quantity_match = re.search(r'(\d+)\s*units?', query_lower)
         if quantity_match:
             result['quantity'] = int(quantity_match.group(1))
         
+        # Extract forecast periods
+        periods_match = re.search(r'(\d+)\s*days?', query_lower)
+        if periods_match:
+            result['periods'] = int(periods_match.group(1))
+        
+        # Extract date ranges
+        date_patterns = [
+            r'(\d{4}-\d{2}-\d{2})\s*to\s*(\d{4}-\d{2}-\d{2})',
+            r'from\s*(\d{4}-\d{2}-\d{2})\s*to\s*(\d{4}-\d{2}-\d{2})',
+            r'(\d{1,2}/\d{1,2}/\d{4})\s*to\s*(\d{1,2}/\d{1,2}/\d{4})'
+        ]
+        for pattern in date_patterns:
+            date_match = re.search(pattern, query_lower)
+            if date_match:
+                result['start_date'] = date_match.group(1)
+                result['end_date'] = date_match.group(2)
+                break
+        
+        # --- LSTM Training Intent ---
+        if 'train' in query_lower and 'lstm' in query_lower:
+            result['intent'] = 'lstm_train'
+            # Extract date range
+            date_matches = re.findall(r'(\d{4}-\d{2}-\d{2})', query)
+            if len(date_matches) >= 2:
+                result['start_date'] = date_matches[0]
+                result['end_date'] = date_matches[1]
+            # Extract product/city if present
+            for city in self.latest['city_name'].unique():
+                if city.lower() in query_lower:
+                    result['city'] = city
+            for pid, info in self.product_map.items():
+                if info['product_name'].lower() in query_lower:
+                    result['product_id'] = pid
+            return result
+        # --- LSTM Prediction Intent ---
+        if 'predict' in query_lower and 'lstm' in query_lower:
+            result['intent'] = 'lstm_predict'
+            for city in self.latest['city_name'].unique():
+                if city.lower() in query_lower:
+                    result['city'] = city
+            for pid, info in self.product_map.items():
+                if info['product_name'].lower() in query_lower:
+                    result['product_id'] = pid
+            return result
+        # --- City Comparison Intent ---
+        if 'compare' in query_lower and 'sales' in query_lower:
+            result['intent'] = 'compare_cities'
+            # Extract two cities
+            cities = [city for city in self.latest['city_name'].unique() if city.lower() in query_lower]
+            if len(cities) >= 2:
+                result['city_1'] = cities[0]
+                result['city_2'] = cities[1]
+            return result
         # Determine intent (order matters - more specific intents first)
-        if any(word in query_lower for word in ['send', 'email', 'notify']):
-            result['intent'] = 'email'
-            result['action'] = 'send_email'
+        if any(word in query_lower for word in ['compare', 'comparison', 'vs', 'versus', 'between']):
+            result['intent'] = 'compare_cities'
+        elif any(word in query_lower for word in ['forecast', 'predict', 'future', 'demand', 'sales prediction', 'forecasting']):
+            result['intent'] = 'lstm_predict'
         elif any(word in query_lower for word in ['allocate', 'distribute', 'allocation', 'how to distribute']):
             result['intent'] = 'allocation'
             result['action'] = 'allocation'
-        elif any(word in query_lower for word in ['forecast', 'predict', 'future', 'demand', 'sales prediction']):
-            result['intent'] = 'forecast'
-            result['action'] = 'forecast'
+        elif any(word in query_lower for word in ['send', 'email', 'notify']):
+            result['intent'] = 'email'
+            result['action'] = 'send_email'
         elif any(word in query_lower for word in ['urgent', 'low stock', 'reorder']) and 'email' not in query_lower:
             result['intent'] = 'urgent_stock'
             result['action'] = 'urgent_po'
@@ -789,22 +882,552 @@ class QuickCommerceChatbot:
         
         return fig1, fig2
     
+    def train_lstm_on_range(self, start_date, end_date, product_id=None, city_name=None):
+        # Filter data for product/city if specified
+        df = self.daily_full.copy()
+        if product_id:
+            df = df[df['product_id'] == product_id]
+        if city_name:
+            df = df[df['city_name'] == city_name]
+        result = train_lstm_for_range(df, start_date, end_date)
+        if 'error' in result:
+            return {'error': result['error']}
+        self.lstm_model = result['model']
+        self.lstm_scaler = result['scaler']
+        self.lstm_metrics = result['metrics']
+        return result['metrics']
+
+    def lstm_predict(self, product_id=None, city_name=None, start_date=None, end_date=None, periods=7):
+        df = self.daily_full.copy()
+        
+        # Filter by product and city if specified (but NOT by date range for training data)
+        if product_id:
+            df = df[df['product_id'] == product_id]
+        if city_name:
+            df = df[df['city_name'] == city_name]
+        
+        # Don't filter by date range here - we need historical data for LSTM
+        # The date range is for the forecast period, not the training data
+        
+        if self.lstm_model is None or self.lstm_scaler is None:
+            return {'error': 'LSTM model not loaded. Please train the model first.'}
+        
+        if len(df) < 14:  # Need at least lookback period
+            return {'error': f'Insufficient data for prediction. Need at least 14 days, got {len(df)} days.'}
+        
+        # Calculate periods based on date range if provided
+        if start_date and end_date:
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(end_date)
+            periods = (end_dt - start_dt).days + 1
+        
+        feature_cols = ['avg_3', 'avg_7', 'avg_14', 'stock_quantity', 'days_of_stock']
+        try:
+            yhat = lstm_forecast_with_model(df, self.lstm_model, self.lstm_scaler, feature_cols, periods=periods)
+            return {
+                'forecast': yhat,
+                'product_id': product_id,
+                'city_name': city_name,
+                'periods': periods,
+                'data_points_used': len(df),
+                'forecast_start_date': start_date,
+                'forecast_end_date': end_date
+            }
+        except Exception as e:
+            return {'error': f'Prediction failed: {str(e)}'}
+    
     def process_query(self, query):
-        """Main query processing function"""
         parsed_query = self.parse_query(query)
         
-        if parsed_query['intent'] == 'allocation':
-            return self.process_allocation_query(parsed_query)
-        elif parsed_query['intent'] == 'forecast':
-            return self.process_forecast_query(parsed_query)
-        elif parsed_query['intent'] == 'urgent_stock':
-            return self.process_urgent_stock_query(parsed_query)
-        elif parsed_query['intent'] == 'analysis':
-            return self.process_analysis_query(parsed_query)
-        elif parsed_query['intent'] == 'email':
-            return self.process_email_query(parsed_query)
+        if parsed_query.get('intent') == 'lstm_predict':
+            product_id = parsed_query.get('product_id')
+            city_name = parsed_query.get('city')
+            start_date = parsed_query.get('start_date')
+            end_date = parsed_query.get('end_date')
+            periods = parsed_query.get('periods', 7)
+            
+            result = self.lstm_predict(product_id, city_name, start_date, end_date, periods)
+            json_out = json.dumps(result, indent=2)
+            
+            try:
+                insight = get_cohere_insight(json_out, query)
+                return json.dumps({"forecast": result, "insight": insight}, indent=2)
+            except Exception as e:
+                return json.dumps({"forecast": result, "insight": f"Cohere AI unavailable: {str(e)}"}, indent=2)
+                
+        elif parsed_query.get('intent') == 'allocation':
+            result = self.handle_allocation(parsed_query)
+            json_out = json.dumps(result, indent=2)
+            try:
+                insight = get_cohere_insight(json_out, query)
+                return json.dumps({"allocation": result, "insight": insight}, indent=2)
+            except Exception as e:
+                return json.dumps({"allocation": result, "insight": f"Cohere AI unavailable: {str(e)}"}, indent=2)
+                
+        elif parsed_query.get('intent') == 'compare_cities':
+            city1 = parsed_query.get('city_1')
+            city2 = parsed_query.get('city_2')
+            df = self.latest.copy()
+            sales1 = df[df['city_name'] == city1]['units_sold'].sum()
+            sales2 = df[df['city_name'] == city2]['units_sold'].sum()
+            result = {
+                'city_1': city1,
+                'city_2': city2,
+                'sales_1': int(sales1),
+                'sales_2': int(sales2),
+                'winner': city1 if sales1 > sales2 else city2 if sales2 > sales1 else 'Tie',
+                'difference': int(abs(sales1 - sales2))
+            }
+            json_out = json.dumps(result, indent=2)
+            
+            try:
+                insight = get_cohere_insight(json_out, query)
+                return json.dumps({"comparison": result, "insight": insight}, indent=2)
+            except Exception as e:
+                return json.dumps({"comparison": result, "insight": f"Cohere AI unavailable: {str(e)}"}, indent=2)
+        
+        # Fallback to existing logic for other intents
+        return "❓ I didn't understand your request. Please try rephrasing or use a supported command."
+
+    def show_lstm_metrics(self, st, metrics_json):
+        metrics = json.loads(metrics_json)
+        st.subheader('LSTM Model Performance Metrics')
+        for k, v in metrics.items():
+            st.metric(k, f'{v:.2f}')
+        st.json(metrics)
+
+    def handle_allocation(self, parsed_query):
+        """Process allocation requests"""
+        if not parsed_query['product_id']:
+            return {'error': 'Please specify a product name or ID for allocation.'}
+        
+        if not parsed_query['quantity']:
+            return {'error': 'Please specify the quantity to allocate (e.g., "allocate 1000 units of Product A").'}
+        
+        product_id = parsed_query['product_id']
+        quantity = parsed_query['quantity']
+        product_info = self.get_product_info(product_id)
+        
+        if not product_info:
+            return {'error': f'Product {product_id} not found.'}
+        
+        # Get current stock levels for all cities
+        product_data = self.latest[self.latest['product_id'] == product_id]
+        
+        if product_data.empty:
+            return {'error': f'No data found for product {product_id}.'}
+        
+        # Calculate allocation using the decision engine
+        allocation_result = compute_allocation(product_data, quantity)
+        
+        return {
+            'product_id': product_id,
+            'product_name': product_info['product_name'],
+            'total_quantity': quantity,
+            'allocation': allocation_result.to_dict('records')
+        }
+
+    def show_ai_insight(self, st, insight):
+        st.subheader('AI Insight (Cohere)')
+        st.info(insight)
+
+    def create_forecast_chart(self, forecast_data, product_id=None, city_name=None):
+        """Create beautiful forecast visualization"""
+        if 'error' in forecast_data:
+            return None
+        
+        forecast_values = forecast_data.get('forecast', [])
+        periods = forecast_data.get('periods', 7)
+        
+        # Create future dates
+        if forecast_data.get('forecast_start_date') and forecast_data.get('forecast_end_date'):
+            # Use the specified date range
+            start_date = pd.to_datetime(forecast_data['forecast_start_date'])
+            end_date = pd.to_datetime(forecast_data['forecast_end_date'])
+            future_dates = pd.date_range(start=start_date, end=end_date, freq='D')
         else:
-            return "❓ **I didn't understand your request.**\n\n**Try these examples:**\n• 'Allocate 1000 units of Gentle Baby Wash'\n• 'Show me sales forecast for Product 445017'\n• 'Check urgent stock for all products'\n• 'Send PO email for Gentle Baby Wash'\n• 'Analyze sales for Mumbai'"
+            # Use default future dates from last data point
+            if city_name and product_id:
+                # Get last date from filtered data
+                df = self.daily_full.copy()
+                if product_id:
+                    df = df[df['product_id'] == product_id]
+                if city_name:
+                    df = df[df['city_name'] == city_name]
+                last_date = df['date'].max()
+            else:
+                last_date = self.daily_full['date'].max()
+            
+            future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=periods)
+        
+        # Create chart with enhanced styling
+        fig = go.Figure()
+        
+        # Add historical data for context (last 30 days)
+        if city_name and product_id:
+            df = self.daily_full.copy()
+            if product_id:
+                df = df[df['product_id'] == product_id]
+            if city_name:
+                df = df[df['city_name'] == city_name]
+            df = df.sort_values('date').tail(30)  # Last 30 days
+            
+            fig.add_trace(go.Scatter(
+                x=df['date'],
+                y=df['units_sold'],
+                mode='lines+markers',
+                name='📊 Historical Sales',
+                line=dict(color='#A23B72', width=3),
+                marker=dict(size=6, color='#A23B72'),
+                opacity=0.8
+            ))
+        
+        # Add forecast data
+        fig.add_trace(go.Scatter(
+            x=future_dates,
+            y=forecast_values,
+            mode='lines+markers',
+            name='🔮 LSTM Forecast',
+            line=dict(color='#2E86AB', width=4),
+            marker=dict(size=8, color='#2E86AB', symbol='diamond')
+        ))
+        
+        # Add confidence interval (simplified)
+        if len(forecast_values) > 0:
+            upper_bound = [x * 1.2 for x in forecast_values]
+            lower_bound = [x * 0.8 for x in forecast_values]
+            
+            fig.add_trace(go.Scatter(
+                x=future_dates,
+                y=upper_bound,
+                mode='lines',
+                line=dict(width=0),
+                showlegend=False,
+                hoverinfo='skip'
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=future_dates,
+                y=lower_bound,
+                mode='lines',
+                line=dict(width=0),
+                fill='tonexty',
+                fillcolor='rgba(46, 134, 171, 0.2)',
+                name='Confidence Interval',
+                hoverinfo='skip'
+            ))
+        
+        # Enhanced layout
+        title_text = f"📈 Sales Forecast"
+        if city_name:
+            title_text += f" - {city_name.title()}"
+        if product_id:
+            title_text += f" - Product {product_id}"
+        
+        fig.update_layout(
+            title=dict(
+                text=title_text,
+                x=0.5,
+                font=dict(size=20, color='#2C3E50')
+            ),
+            xaxis=dict(
+                title=dict(text="📅 Date", font=dict(size=14, color='#34495E')),
+                tickfont=dict(size=12),
+                gridcolor='rgba(128,128,128,0.2)'
+            ),
+            yaxis=dict(
+                title=dict(text="📦 Units Sold", font=dict(size=14, color='#34495E')),
+                tickfont=dict(size=12),
+                gridcolor='rgba(128,128,128,0.2)'
+            ),
+            hovermode='x unified',
+            template='plotly_white',
+            height=600,
+            showlegend=True,
+            legend=dict(
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="right",
+                x=1
+            ),
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=50, r=50, t=80, b=50)
+        )
+        
+        # Add annotations
+        if len(forecast_values) > 0:
+            max_forecast = max(forecast_values)
+            max_date = future_dates[forecast_values.index(max_forecast)]
+            
+            fig.add_annotation(
+                x=max_date,
+                y=max_forecast,
+                text=f"Peak: {max_forecast:.0f} units",
+                showarrow=True,
+                arrowhead=2,
+                arrowcolor='#E74C3C',
+                bgcolor='rgba(255,255,255,0.8)',
+                bordercolor='#E74C3C',
+                borderwidth=1
+            )
+        
+        return fig
+
+    def create_comparison_chart(self, comparison_data):
+        """Create beautiful city comparison chart"""
+        if 'error' in comparison_data:
+            return None
+        
+        city1 = comparison_data.get('city_1', 'City 1')
+        city2 = comparison_data.get('city_2', 'City 2')
+        sales1 = comparison_data.get('sales_1', 0)
+        sales2 = comparison_data.get('sales_2', 0)
+        winner = comparison_data.get('winner', '')
+        difference = comparison_data.get('difference', 0)
+        
+        # Determine colors based on winner
+        color1 = '#27AE60' if city1.lower() == winner.lower() else '#E74C3C'
+        color2 = '#27AE60' if city2.lower() == winner.lower() else '#E74C3C'
+        
+        fig = go.Figure(data=[
+            go.Bar(
+                x=[city1.title(), city2.title()],
+                y=[sales1, sales2],
+                marker_color=[color1, color2],
+                text=[f'{sales1:,}', f'{sales2:,}'],
+                textposition='outside',
+                textfont=dict(size=14, color='#2C3E50'),
+                marker_line=dict(width=2, color='#34495E'),
+                hovertemplate='<b>%{x}</b><br>Sales: %{y:,}<br><extra></extra>'
+            )
+        ])
+        
+        # Add difference annotation
+        max_sales = max(sales1, sales2)
+        fig.add_annotation(
+            x=0.5,
+            y=max_sales * 1.1,
+            text=f"Difference: {difference:,} units",
+            showarrow=False,
+            font=dict(size=16, color='#2C3E50'),
+            bgcolor='rgba(255,255,255,0.8)',
+            bordercolor='#34495E',
+            borderwidth=1
+        )
+        
+        fig.update_layout(
+            title=dict(
+                text=f"🏆 Sales Comparison: {city1.title()} vs {city2.title()}",
+                x=0.5,
+                font=dict(size=20, color='#2C3E50')
+            ),
+            xaxis=dict(
+                title=dict(text="🏙️ Cities", font=dict(size=14, color='#34495E')),
+                tickfont=dict(size=12),
+                gridcolor='rgba(128,128,128,0.2)'
+            ),
+            yaxis=dict(
+                title=dict(text="💰 Total Sales", font=dict(size=14, color='#34495E')),
+                tickfont=dict(size=12),
+                gridcolor='rgba(128,128,128,0.2)'
+            ),
+            height=500,
+            showlegend=False,
+            template='plotly_white',
+            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor='rgba(0,0,0,0)',
+            margin=dict(l=50, r=50, t=80, b=50)
+        )
+        
+        return fig
+
+    def create_allocation_visualization(self, allocation_data):
+        """Create allocation visualization charts"""
+        if 'error' in allocation_data:
+            return None
+        
+        allocation_df = pd.DataFrame(allocation_data['allocation'])
+        
+        # Chart 1: Current Stock vs Allocated
+        fig1 = go.Figure()
+        
+        fig1.add_trace(go.Bar(
+            x=allocation_df['city_name'],
+            y=allocation_df['stock_quantity'],
+            name='Current Stock',
+            marker_color='#E74C3C',
+            text=allocation_df['stock_quantity'].astype(str),
+            textposition='outside'
+        ))
+        
+        fig1.add_trace(go.Bar(
+            x=allocation_df['city_name'],
+            y=allocation_df['recommended_allocation'],
+            name='Recommended Allocation',
+            marker_color='#27AE60',
+            text=allocation_df['recommended_allocation'].astype(str),
+            textposition='outside'
+        ))
+        
+        fig1.update_layout(
+            title=dict(text=f"📦 Stock Allocation: {allocation_data['product_name']}", x=0.5),
+            xaxis=dict(title="Cities"),
+            yaxis=dict(title="Units"),
+            barmode='group',
+            height=400,
+            template='plotly_white'
+        )
+        
+        # Chart 2: Allocation Distribution Pie Chart
+        fig2 = go.Figure(data=[go.Pie(
+            labels=allocation_df['city_name'],
+            values=allocation_df['recommended_allocation'],
+            hole=0.3,
+            textinfo='label+percent+value'
+        )])
+        
+        fig2.update_layout(
+            title=dict(text=f"🎯 Allocation Distribution: {allocation_data['product_name']}", x=0.5),
+            height=400,
+            template='plotly_white'
+        )
+        
+        return (fig1, fig2, allocation_df)
+
+    def format_response_for_user(self, response):
+        """Format the AI response into a user-friendly format"""
+        try:
+            # Try to parse as JSON first
+            if isinstance(response, str):
+                response_data = json.loads(response)
+            else:
+                response_data = response
+            
+            # Format comparison responses
+            if 'comparison' in response_data:
+                comparison = response_data['comparison']
+                insight = response_data.get('insight', '')
+                
+                city1 = comparison.get('city_1', '').title()
+                city2 = comparison.get('city_2', '').title()
+                sales1 = comparison.get('sales_1', 0)
+                sales2 = comparison.get('sales_2', 0)
+                winner = comparison.get('winner', '').title()
+                difference = comparison.get('difference', 0)
+                
+                # Calculate percentage difference
+                percentage_diff = (difference / max(sales1, sales2)) * 100 if max(sales1, sales2) > 0 else 0
+                
+                formatted = f"""
+## 🏆 **Sales Comparison Results**
+
+### 📊 **Performance Summary**
+- **{city1}**: {sales1:,} units sold
+- **{city2}**: {sales2:,} units sold
+- **Winner**: {winner} 🥇
+- **Difference**: {difference:,} units ({percentage_diff:.1f}% higher)
+
+### 📈 **Key Insights**
+{insight}
+
+---
+*Data analyzed using advanced AI algorithms*
+"""
+                return formatted
+            
+            # Format forecast responses
+            elif 'forecast' in response_data:
+                forecast = response_data['forecast']
+                insight = response_data.get('insight', '')
+                
+                if 'error' in forecast:
+                    return f"❌ **Forecast Error**: {forecast['error']}"
+                
+                product_id = forecast.get('product_id', 'All Products')
+                city_name = forecast.get('city_name', 'All Cities')
+                periods = forecast.get('periods', 7)
+                forecast_values = forecast.get('forecast', [])
+                
+                if forecast_values:
+                    avg_forecast = sum(forecast_values) / len(forecast_values)
+                    max_forecast = max(forecast_values)
+                    min_forecast = min(forecast_values)
+                    
+                    # Safe city name formatting
+                    location_display = city_name.title() if city_name and city_name != 'All Cities' else 'All Cities'
+                    
+                    formatted = f"""
+## 🔮 **Sales Forecast Results**
+
+### 📋 **Forecast Details**
+- **Product**: {product_id}
+- **Location**: {location_display}
+- **Period**: {periods} days
+- **Average Daily Sales**: {avg_forecast:.1f} units
+- **Peak Sales**: {max_forecast:.1f} units
+- **Minimum Sales**: {min_forecast:.1f} units
+
+### 📊 **Daily Forecast**
+"""
+                    for i, value in enumerate(forecast_values, 1):
+                        formatted += f"- **Day {i}**: {value:.1f} units\n"
+                    
+                    formatted += f"""
+### 🧠 **AI Insights**
+{insight}
+
+---
+*Powered by LSTM Neural Network*
+"""
+                    return formatted
+            
+            # Format allocation responses
+            elif 'allocation' in response_data:
+                allocation = response_data['allocation']
+                insight = response_data.get('insight', '')
+                
+                if 'error' in allocation:
+                    return f"❌ **Allocation Error**: {allocation['error']}"
+                
+                product_name = allocation.get('product_name', 'Unknown Product')
+                total_quantity = allocation.get('total_quantity', 0)
+                allocation_data = allocation.get('allocation', [])
+                
+                formatted = f"""
+## 📦 **Allocation Results**
+
+### 🎯 **Allocation Summary**
+- **Product**: {product_name}
+- **Total Quantity**: {total_quantity:,} units
+- **Cities**: {len(allocation_data)} locations
+
+### 🏙️ **City-wise Distribution**
+"""
+                for item in allocation_data:
+                    city = item.get('city_name', '').title()
+                    allocated = item.get('recommended_allocation', 0)
+                    current_stock = item.get('stock_quantity', 0)
+                    status = "🚨 URGENT" if current_stock < 10 else "⚠️ LOW" if current_stock < 50 else "✅ OK"
+                    formatted += f"- **{city}**: {allocated:,} units (Current: {current_stock:,}) {status}\n"
+                
+                formatted += f"""
+### 🧠 **AI Insights**
+{insight}
+
+---
+*Optimized using advanced allocation algorithms*
+"""
+                return formatted
+            
+            # Fallback for other responses
+            else:
+                return response
+                
+        except (json.JSONDecodeError, KeyError, TypeError):
+            # If parsing fails, return original response
+            return response
 
 def main():
     st.set_page_config(
@@ -940,6 +1563,44 @@ def main():
         sales_file = st.file_uploader("Upload Sales Data (CSV)", type=['csv'], key='sales_upload')
         inv_file = st.file_uploader("Upload Inventory Data (CSV)", type=['csv'], key='inv_upload')
         
+        # --- JSON Input to Cohere AI ---
+        if hasattr(st.session_state, 'last_response') and st.session_state.last_response:
+            try:
+                response_data = st.session_state.last_response
+                if 'forecast' in response_data:
+                    st.markdown("---")
+                    st.subheader('🔍 JSON Input to Cohere AI')
+                    st.json(response_data['forecast'])
+                elif 'comparison' in response_data:
+                    st.markdown("---")
+                    st.subheader('🔍 JSON Input to Cohere AI')
+                    st.json(response_data['comparison'])
+                elif 'allocation' in response_data:
+                    st.markdown("---")
+                    st.subheader('🔍 JSON Input to Cohere AI')
+                    st.json(response_data['allocation'])
+            except Exception as e:
+                st.error(f"Error displaying JSON: {e}")
+                pass
+        
+        # --- LSTM Model Metrics (Hidden by default) ---
+        if hasattr(chatbot, 'lstm_metrics') and chatbot.lstm_metrics:
+            with st.expander("📊 LSTM Model Performance (Click to view)"):
+                for metric, value in chatbot.lstm_metrics.items():
+                    st.metric(metric, f"{value:.4f}")
+        
+        # --- Cohere AI Insight ---
+        if hasattr(st.session_state, 'last_response') and st.session_state.last_response:
+            try:
+                response_data = st.session_state.last_response
+                if 'insight' in response_data and response_data['insight']:
+                    st.markdown("---")
+                    st.subheader('🤖 AI Insight (Cohere)')
+                    st.info(response_data['insight'])
+            except Exception as e:
+                st.error(f"Error displaying insight: {e}")
+                pass
+        
         if sales_file and inv_file:
             if st.button("🔄 Load Data", use_container_width=True):
                 with st.spinner("Loading and processing data..."):
@@ -953,6 +1614,21 @@ def main():
         else:
             st.info("📤 Please upload both sales and inventory CSV files to start")
             st.session_state.data_loaded = False
+
+        # --- LSTM Model Status Section ---
+        if st.session_state.get('data_loaded', False):
+            st.markdown('---')
+            st.header("🧠 LSTM Model Status")
+            if hasattr(chatbot, 'lstm_metrics') and chatbot.lstm_metrics:
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("MAE", f"{chatbot.lstm_metrics.get('MAE', 0):.2f}")
+                    st.metric("RMSE", f"{chatbot.lstm_metrics.get('RMSE', 0):.2f}")
+                with col2:
+                    st.metric("MAPE", f"{chatbot.lstm_metrics.get('MAPE', 0):.2f}%")
+                    st.metric("SMAPE", f"{chatbot.lstm_metrics.get('SMAPE', 0):.2f}%")
+            else:
+                st.info("No LSTM model metrics available. Train the model first using the CLI command shown above.")
     
     # Main chat interface
     if st.session_state.get('data_loaded', False):
@@ -1043,6 +1719,59 @@ def main():
                     # Clear charts after display
                     del st.session_state.allocation_charts
                 
+                # Display charts for forecast queries
+                if 'forecast_chart' in st.session_state:
+                    st.markdown("---")
+                    st.subheader("📊 **Sales Forecast Visualization**")
+                    st.plotly_chart(st.session_state.forecast_chart, use_container_width=True)
+                    del st.session_state.forecast_chart
+                
+                # Display charts for allocation queries
+                elif 'allocation_charts' in st.session_state:
+                    st.markdown("---")
+                    st.subheader("📊 **Allocation Analysis**")
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.plotly_chart(st.session_state.allocation_charts[0], use_container_width=True)
+                    with col2:
+                        st.plotly_chart(st.session_state.allocation_charts[1], use_container_width=True)
+                    
+                    # Show detailed table
+                    st.markdown("---")
+                    st.subheader("📋 **Detailed City-wise Breakdown**")
+                    
+                    allocation_df = st.session_state.allocation_charts[2]
+                    # Format the dataframe for better display
+                    display_df = allocation_df.copy()
+                    display_df['Current Stock'] = display_df['stock_quantity'].astype(int)
+                    display_df['Allocated'] = display_df['recommended_allocation'].astype(int)
+                    display_df['Status'] = display_df.apply(lambda row: '🚨 URGENT' if row['stock_quantity'] < 10 else '⚠️ LOW' if row['stock_quantity'] < 50 else '✅ OK', axis=1)
+                    
+                    # Select and rename columns for display
+                    display_df = display_df[['city_name', 'Current Stock', 'Allocated', 'Status']].rename(columns={'city_name': 'City'})
+                    
+                    st.dataframe(
+                        display_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "City": st.column_config.TextColumn("🏙️ City", width="medium"),
+                            "Current Stock": st.column_config.NumberColumn("📦 Current Stock", width="small"),
+                            "Allocated": st.column_config.NumberColumn("🎯 Allocated", width="small"),
+                            "Status": st.column_config.TextColumn("📊 Status", width="small")
+                        }
+                    )
+                    
+                    del st.session_state.allocation_charts
+                
+                # Display charts for comparison queries
+                elif 'comparison_chart' in st.session_state:
+                    st.markdown("---")
+                    st.subheader("📊 **City Comparison Visualization**")
+                    st.plotly_chart(st.session_state.comparison_chart, use_container_width=True)
+                    del st.session_state.comparison_chart
+                
                 # Display charts for analysis queries
                 elif (i > 0 and 
                       st.session_state.chat_history[i-1]['type'] == 'user' and 
@@ -1114,43 +1843,69 @@ def main():
             with st.spinner("🤔 Thinking..."):
                 response = chatbot.process_query(user_input)
                 
-                # Check if this is an urgent stock query and create visualizations
-                if "urgent stock" in user_input.lower() and "all products" in user_input.lower():
-                    # Get urgent products data for visualization
-                    urgent_products = []
-                    for product_id in chatbot.latest['product_id'].unique():
-                        product_latest = chatbot.latest[chatbot.latest['product_id'] == product_id]
-                        urgent_cities = product_latest[product_latest.apply(lambda r: check_urgent(r['stock_quantity'], r['avg_3']), axis=1)]
-                        if not urgent_cities.empty:
-                            product_info = chatbot.get_product_info(product_id)
-                            urgent_products.append({
-                                'product_id': product_id,
-                                'product_name': product_info['product_name'],
-                                'urgent_cities': urgent_cities,
-                                'total_urgent_qty': urgent_cities['avg_7'].sum() * 7
-                            })
+                # Parse response and create visualizations
+                try:
+                    response_data = json.loads(response)
                     
-                    if urgent_products:
-                        urgent_products.sort(key=lambda x: x['total_urgent_qty'], reverse=True)
-                        fig1, fig2 = chatbot.create_urgent_stock_visualization(urgent_products)
-                        
-                        # Store charts in session state for display
-                        st.session_state.urgent_charts = (fig1, fig2)
-                
-                # Check if this is an allocation query and create visualizations
-                elif any(word in user_input.lower() for word in ['allocate', 'distribute', 'allocation']):
-                    # Allocation charts are already created in the process_allocation_query method
+                    # Store response data for display
+                    st.session_state.last_response = response_data
+                    
+                    # Create charts based on response type
+                    print(f"🔍 Response data keys: {list(response_data.keys())}")
+                    
+                    if 'forecast' in response_data:
+                        print("📊 Creating forecast chart...")
+                        forecast_data = response_data['forecast']
+                        if 'error' not in forecast_data:
+                            # Extract product and city from the forecast data
+                            product_id = forecast_data.get('product_id')
+                            city_name = forecast_data.get('city_name')
+                            chart = chatbot.create_forecast_chart(forecast_data, product_id, city_name)
+                            if chart:
+                                st.session_state.forecast_chart = chart
+                                print("✅ Forecast chart created and stored in session state")
+                            else:
+                                print("❌ Failed to create forecast chart")
+                        else:
+                            print(f"❌ Forecast error: {forecast_data['error']}")
+                    
+                    elif 'comparison' in response_data:
+                        print("📊 Creating comparison chart...")
+                        comparison_data = response_data['comparison']
+                        if 'error' not in comparison_data:
+                            chart = chatbot.create_comparison_chart(comparison_data)
+                            if chart:
+                                st.session_state.comparison_chart = chart
+                                print("✅ Comparison chart created and stored in session state")
+                            else:
+                                print("❌ Failed to create comparison chart")
+                        else:
+                            print(f"❌ Comparison error: {comparison_data['error']}")
+                    
+                    elif 'allocation' in response_data:
+                        print("📊 Creating allocation charts...")
+                        allocation_data = response_data['allocation']
+                        if 'error' not in allocation_data:
+                            charts = chatbot.create_allocation_visualization(allocation_data)
+                            if charts:
+                                st.session_state.allocation_charts = charts
+                                print("✅ Allocation charts created and stored in session state")
+                            else:
+                                print("❌ Failed to create allocation charts")
+                        else:
+                            print(f"❌ Allocation error: {allocation_data['error']}")
+                                
+                except json.JSONDecodeError:
+                    # Handle non-JSON responses
                     pass
-                
-                # Check if this is an analysis query and create visualizations
-                elif any(word in user_input.lower() for word in ['analyze', 'analysis', 'performance', 'sales']):
-                    # Analysis charts are already created in the process_analysis_query method
-                    pass
+            
+            # Format response for better user experience
+            formatted_response = chatbot.format_response_for_user(response)
             
             # Add AI response to history
             st.session_state.chat_history.append({
                 'type': 'ai',
-                'content': response
+                'content': formatted_response
             })
             
             st.rerun()
@@ -1169,18 +1924,18 @@ def main():
         
         # Real example questions that show actual capabilities
         examples = [
-            "Check urgent stock for all products",
-            "Allocate 1000 units of Gentle Baby Wash",
-            "Send PO email for Caring Baby Wipes",
-            "Analyze sales performance for Mumbai"
+            "Compare sales between Delhi and Mumbai",
+            "Predict sales for Product 445017 in Chennai for 7 days",
+            "Forecast demand from 2025-01-01 to 2025-01-31",
+            "Allocate 1000 units for Gentle Baby Wash"
         ]
         
         # Create 2x2 grid layout
         col1, col2 = st.columns(2)
         
         with col1:
-            if st.button("💬 Check urgent stock for all products", key="example_0", use_container_width=True):
-                example = "Check urgent stock for all products"
+            if st.button("💬 Compare sales between Delhi and Mumbai", key="example_0", use_container_width=True):
+                example = "Compare sales between Delhi and Mumbai"
                 # Process the example query directly
                 with st.spinner("🤔 Thinking..."):
                     response = chatbot.process_query(example)
@@ -1220,8 +1975,8 @@ def main():
                 
                 st.rerun()
             
-            if st.button("💬 Allocate 1000 units of Gentle Baby Wash", key="example_1", use_container_width=True):
-                example = "Allocate 1000 units of Gentle Baby Wash"
+            if st.button("💬 Predict sales for Product 445017 in Chennai for 7 days", key="example_1", use_container_width=True):
+                example = "Predict sales for Product 445017 in Chennai for 7 days"
                 # Process the example query directly
                 with st.spinner("🤔 Thinking..."):
                     response = chatbot.process_query(example)
@@ -1244,8 +1999,8 @@ def main():
                 st.rerun()
         
         with col2:
-            if st.button("💬 Send PO email for Caring Baby Wipes", key="example_2", use_container_width=True):
-                example = "Send PO email for Caring Baby Wipes"
+            if st.button("💬 Forecast demand from 2025-01-01 to 2025-01-31", key="example_2", use_container_width=True):
+                example = "Forecast demand from 2025-01-01 to 2025-01-31"
                 # Process the example query directly
                 with st.spinner("🤔 Thinking..."):
                     response = chatbot.process_query(example)
@@ -1262,8 +2017,8 @@ def main():
                 
                 st.rerun()
             
-            if st.button("💬 Analyze sales performance for Mumbai", key="example_3", use_container_width=True):
-                example = "Analyze sales performance for Mumbai"
+            if st.button("💬 Allocate 1000 units for Gentle Baby Wash", key="example_3", use_container_width=True):
+                example = "Allocate 1000 units for Gentle Baby Wash"
                 # Process the example query directly
                 with st.spinner("🤔 Thinking..."):
                     response = chatbot.process_query(example)

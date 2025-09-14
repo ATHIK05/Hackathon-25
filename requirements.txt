@@ -10,3 +10,7 @@ pyyaml
 requests
 python-dotenv
 prophet
+tensorflow
+keras
+langchain
+cohere
